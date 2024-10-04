@@ -250,7 +250,7 @@ class VideoCombine:
         service = build('drive', 'v3', credentials=credentials)
 
         # Tải file lên Google Drive
-        file_metadata = {'name': os.path.basename(file_path)}, 'parents': ['1fZyeDT_eW6ozYXhqi_qLVy-Xnu5JD67a']}
+        file_metadata = {'name': os.path.basename(file_path), 'parents': ['1fZyeDT_eW6ozYXhqi_qLVy-Xnu5JD67a']}
         media = MediaFileUpload(file_path, resumable=True)
 
         file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
