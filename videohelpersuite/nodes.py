@@ -22,6 +22,9 @@ from .load_images_nodes import LoadImagesFromDirectoryUpload, LoadImagesFromDire
 from .batched_nodes import VAEEncodeBatched, VAEDecodeBatched
 from .utils import ffmpeg_path, get_audio, hash_path, validate_path, requeue_workflow, gifski_path, calculate_file_hash, strip_path, try_download_video, is_url, imageOrLatent
 from comfy.utils import ProgressBar
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 folder_paths.folder_names_and_paths["VHS_video_formats"] = (
     [
@@ -218,7 +221,6 @@ class VideoCombine:
                 "format": (["image/gif", "image/webp"] + ffmpeg_formats,),
                 "pingpong": ("BOOLEAN", {"default": False}),
                 "save_output": ("BOOLEAN", {"default": True}),
-                "upload_to_drive": ("BOOLEAN", {"default": False}),  # Thêm trường để người dùng chọn upload lên Google Drive
             },
             "optional": {
                 "audio": ("AUDIO",),
@@ -238,6 +240,26 @@ class VideoCombine:
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     FUNCTION = "combine_video"
 
+    def upload_to_google_drive(self, file_path):
+        # Thiết lập xác thực
+        SCOPES = ['https://www.googleapis.com/auth/drive.file']
+        SERVICE_ACCOUNT_FILE = '/content/drive/MyDrive/SD-Data/comfyui-n8n-aici01-7679b55c962b.json'
+
+        credentials = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        service = build('drive', 'v3', credentials=credentials)
+
+        # Tải file lên Google Drive
+        file_metadata = {'name': os.path.basename(file_path)}
+        media = MediaFileUpload(file_path, resumable=True)
+
+        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        file_id = file.get('id')
+
+        # Lấy link chia sẻ của file
+        drive_link = f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
+        return drive_link
+        
     def combine_video(
         self,
         frame_rate: int,
@@ -254,8 +276,7 @@ class VideoCombine:
         unique_id=None,
         manual_format_widgets=None,
         meta_batch=None,
-        vae=None,
-        upload_to_drive=False  # Thêm tham số để upload lên Google Drive
+        vae=None
     ):
         if latents is not None:
             images = latents
@@ -273,25 +294,25 @@ class VideoCombine:
         pbar = ProgressBar(num_frames)
         if vae is not None:
             downscale_ratio = getattr(vae, "downscale_ratio", 8)
-            width = images.size(3) * downscale_ratio
-            height = images.size(2) * downscale_ratio
+            width = images.size(3)*downscale_ratio
+            height = images.size(2)*downscale_ratio
             frames_per_batch = (1920 * 1080 * 16) // (width * height) or 1
-
+            #Python 3.12 adds an itertools.batched, but it's easily replicated for legacy support
             def batched(it, n):
                 while batch := tuple(itertools.islice(it, n)):
                     yield batch
-
             def batched_encode(images, vae, frames_per_batch):
                 for batch in batched(iter(images), frames_per_batch):
                     image_batch = torch.from_numpy(np.array(batch))
                     yield from vae.decode(image_batch)
-
             images = batched_encode(images, vae, frames_per_batch)
             first_image = next(images)
+            #repush first_image
             images = itertools.chain([first_image], images)
         else:
             first_image = images[0]
             images = iter(images)
+        # get output information
         output_dir = (
             folder_paths.get_output_directory()
             if save_output
@@ -320,17 +341,26 @@ class VideoCombine:
         if meta_batch is not None and unique_id in meta_batch.outputs:
             (counter, output_process) = meta_batch.outputs[unique_id]
         else:
+            # comfy counter workaround
             max_counter = 0
+
+            # Loop through the existing files
             matcher = re.compile(f"{re.escape(filename)}_(\\d+)\\D*\\..+", re.IGNORECASE)
             for existing_file in os.listdir(full_output_folder):
+                # Check if the file matches the expected format
                 match = matcher.fullmatch(existing_file)
                 if match:
+                    # Extract the numeric portion of the filename
                     file_counter = int(match.group(1))
+                    # Update the maximum counter value if necessary
                     if file_counter > max_counter:
                         max_counter = file_counter
+
+            # Increment the counter by 1 to get the next available value
             counter = max_counter + 1
             output_process = None
 
+        # save first frame as png to keep metadata
         file = f"{filename}_{counter:05}.png"
         file_path = os.path.join(full_output_folder, file)
         Image.fromarray(tensor_to_bytes(first_image)).save(
@@ -339,7 +369,9 @@ class VideoCombine:
             compress_level=4,
         )
         output_files.append(file_path)
-
+        drive_link = self.upload_to_google_drive(file_path)
+        output_files.append(drive_link)
+        
         format_type, format_ext = format.split("/")
         if format_type == "image":
             if meta_batch is not None:
@@ -348,6 +380,7 @@ class VideoCombine:
             if format_ext == "gif":
                 image_kwargs['disposal'] = 2
             if format_ext == "webp":
+                #Save timestamp information
                 exif = Image.Exif()
                 exif[ExifTags.IFD.Exif] = {36867: datetime.datetime.now().isoformat(" ")[:19]}
                 image_kwargs['exif'] = exif
@@ -355,7 +388,8 @@ class VideoCombine:
             file_path = os.path.join(full_output_folder, file)
             if pingpong:
                 images = to_pingpong(images)
-            frames = map(lambda x: Image.fromarray(tensor_to_bytes(x)), images)
+            frames = map(lambda x : Image.fromarray(tensor_to_bytes(x)), images)
+            # Use pillow directly to save an animated image
             next(frames).save(
                 file_path,
                 format=format_ext.upper(),
@@ -367,10 +401,14 @@ class VideoCombine:
                 **image_kwargs
             )
             output_files.append(file_path)
+            drive_link = self.upload_to_google_drive(file_path)
+            output_files.append(drive_link)
         else:
+            # Use ffmpeg to save a video
             if ffmpeg_path is None:
                 raise ProcessLookupError(f"ffmpeg is required for video outputs and could not be found.\nIn order to use video outputs, you must either:\n- Install imageio-ffmpeg with pip,\n- Place a ffmpeg executable in {os.path.abspath('')}, or\n- Install ffmpeg and add it to the system path.")
 
+            #Acquire additional format_widget values
             kwargs = None
             if manual_format_widgets is None:
                 if prompt is not None:
@@ -392,15 +430,16 @@ class VideoCombine:
             has_alpha = first_image.shape[-1] == 4
             dim_alignment = video_format.get("dim_alignment", 8)
             if (first_image.shape[1] % dim_alignment) or (first_image.shape[0] % dim_alignment):
+                #output frames must be padded
                 to_pad = (-first_image.shape[1] % dim_alignment,
                           -first_image.shape[0] % dim_alignment)
-                padding = (to_pad[0] // 2, to_pad[0] - to_pad[0] // 2,
-                           to_pad[1] // 2, to_pad[1] - to_pad[1] // 2)
+                padding = (to_pad[0]//2, to_pad[0] - to_pad[0]//2,
+                           to_pad[1]//2, to_pad[1] - to_pad[1]//2)
                 padfunc = torch.nn.ReplicationPad2d(padding)
                 def pad(image):
-                    image = image.permute((2, 0, 1))
+                    image = image.permute((2,0,1))#HWC to CHW
                     padded = padfunc(image.to(dtype=torch.float32))
-                    return padded.permute((1, 2, 0))
+                    return padded.permute((1,2,0))
                 images = map(pad, images)
                 new_dims = (-first_image.shape[1] % dim_alignment + first_image.shape[1],
                             -first_image.shape[0] % dim_alignment + first_image.shape[0])
@@ -409,35 +448,154 @@ class VideoCombine:
             else:
                 dimensions = f"{first_image.shape[1]}x{first_image.shape[0]}"
             if loop_count > 0:
-                num_frames *= (loop_count + 1)
-            output_files = output_video_ffmpeg(output_files, images, dimensions, video_format, audio, frame_rate)
+                loop_args = ["-vf", "loop=loop=" + str(loop_count)+":size=" + str(num_frames)]
+            else:
+                loop_args = []
+            if pingpong:
+                if meta_batch is not None:
+                    logger.error("pingpong is incompatible with batched output")
+                images = to_pingpong(images)
+            if video_format.get('input_color_depth', '8bit') == '16bit':
+                images = map(tensor_to_shorts, images)
+                if has_alpha:
+                    i_pix_fmt = 'rgba64'
+                else:
+                    i_pix_fmt = 'rgb48'
+            else:
+                images = map(tensor_to_bytes, images)
+                if has_alpha:
+                    i_pix_fmt = 'rgba'
+                else:
+                    i_pix_fmt = 'rgb24'
+            file = f"{filename}_{counter:05}.{video_format['extension']}"
+            file_path = os.path.join(full_output_folder, file)
+            bitrate_arg = []
+            bitrate = video_format.get('bitrate')
+            if bitrate is not None:
+                bitrate_arg = ["-b:v", str(bitrate) + "M" if video_format.get('megabit') == 'True' else str(bitrate) + "K"]
+            args = [ffmpeg_path, "-v", "error", "-f", "rawvideo", "-pix_fmt", i_pix_fmt,
+                    "-s", dimensions, "-r", str(frame_rate), "-i", "-"] \
+                    + loop_args
 
-        # Thêm phần upload file lên Google Drive
-        if upload_to_drive:
-            for output_file in output_files:
-                self.upload_file_to_drive(output_file)
+            images = map(lambda x: x.tobytes(), images)
+            env=os.environ.copy()
+            if  "environment" in video_format:
+                env.update(video_format["environment"])
 
-        return (output_files,)
+            if "pre_pass" in video_format:
+                if meta_batch is not None:
+                    #Performing a prepass requires keeping access to all frames.
+                    #Potential solutions include keeping just output frames in
+                    #memory or using 3 passes with intermediate file, but
+                    #very long gifs probably shouldn't be encouraged
+                    raise Exception("Formats which require a pre_pass are incompatible with Batch Manager.")
+                images = [b''.join(images)]
+                os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
+                pre_pass_args = args[:13] + video_format['pre_pass']
+                try:
+                    subprocess.run(pre_pass_args, input=images[0], env=env,
+                                   capture_output=True, check=True)
+                except subprocess.CalledProcessError as e:
+                    raise Exception("An error occurred in the ffmpeg prepass:\n" \
+                            + e.stderr.decode("utf-8"))
+            if "inputs_main_pass" in video_format:
+                args = args[:13] + video_format['inputs_main_pass'] + args[13:]
 
-    def upload_file_to_drive(self, file_path):
-        # Thay thế YOUR_ACCESS_TOKEN bằng token truy cập của bạn
-        url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-        headers = {
-            "Authorization": "Bearer YOUR_ACCESS_TOKEN",
-            "Content-Type": "application/json; charset=UTF-8"
-        }
-        file_metadata = {
-            'name': os.path.basename(file_path)
-        }
-        media = {
-            'mimeType': 'video/mp4',  # Định dạng video, thay đổi nếu cần
-            'body': open(file_path, 'rb')
-        }
-        response = requests.post(url, headers=headers, params={'uploadType': 'multipart'}, json=file_metadata, files=media)
-        if response.status_code == 200:
-            print(f"File {file_path} uploaded successfully: {response.json()['id']}")
-        else:
-            print(f"Failed to upload {file_path}: {response.text}")
+            if output_process is None:
+                if 'gifski_pass' in video_format:
+                    output_process = gifski_process(args, video_format, file_path, env)
+                else:
+                    args += video_format['main_pass'] + bitrate_arg
+                    output_process = ffmpeg_process(args, video_format, video_metadata, file_path, env)
+                #Proceed to first yield
+                output_process.send(None)
+                if meta_batch is not None:
+                    meta_batch.outputs[unique_id] = (counter, output_process)
+
+            for image in images:
+                pbar.update(1)
+                output_process.send(image)
+            if meta_batch is not None:
+                requeue_workflow((meta_batch.unique_id, not meta_batch.has_closed_inputs))
+            if meta_batch is None or meta_batch.has_closed_inputs:
+                #Close pipe and wait for termination.
+                try:
+                    total_frames_output = output_process.send(None)
+                    output_process.send(None)
+                except StopIteration:
+                    pass
+                if meta_batch is not None:
+                    meta_batch.outputs.pop(unique_id)
+                    if len(meta_batch.outputs) == 0:
+                        meta_batch.reset()
+            else:
+                #batch is unfinished
+                #TODO: Check if empty output breaks other custom nodes
+                return {"ui": {"unfinished_batch": [True]}, "result": ((save_output, []),)}
+
+            output_files.append(file_path)
+            drive_link = self.upload_to_google_drive(file_path)
+            output_files.append(drive_link)
+
+            a_waveform = None
+            if audio is not None:
+                try:
+                    #safely check if audio produced by VHS_LoadVideo actually exists
+                    a_waveform = audio['waveform']
+                except:
+                    pass
+            if a_waveform is not None:
+                # Create audio file if input was provided
+                output_file_with_audio = f"{filename}_{counter:05}-audio.{video_format['extension']}"
+                output_file_with_audio_path = os.path.join(full_output_folder, output_file_with_audio)
+                if "audio_pass" not in video_format:
+                    logger.warn("Selected video format does not have explicit audio support")
+                    video_format["audio_pass"] = ["-c:a", "libopus"]
+
+
+                # FFmpeg command with audio re-encoding
+                #TODO: expose audio quality options if format widgets makes it in
+                #Reconsider forcing apad/shortest
+                channels = audio['waveform'].size(1)
+                min_audio_dur = total_frames_output / frame_rate + 1
+                mux_args = [ffmpeg_path, "-v", "error", "-n", "-i", file_path,
+                            "-ar", str(audio['sample_rate']), "-ac", str(channels),
+                            "-f", "f32le", "-i", "-", "-c:v", "copy"] \
+                            + video_format["audio_pass"] \
+                            + ["-af", "apad=whole_dur="+str(min_audio_dur),
+                               "-shortest", output_file_with_audio_path]
+
+                audio_data = audio['waveform'].squeeze(0).transpose(0,1) \
+                        .numpy().tobytes()
+                try:
+                    res = subprocess.run(mux_args, input=audio_data,
+                                         env=env, capture_output=True, check=True)
+                except subprocess.CalledProcessError as e:
+                    raise Exception("An error occured in the ffmpeg subprocess:\n" \
+                            + e.stderr.decode("utf-8"))
+                if res.stderr:
+                    print(res.stderr.decode("utf-8"), end="", file=sys.stderr)
+                output_files.append(output_file_with_audio_path)
+                #Return this file with audio to the webui.
+                #It will be muted unless opened or saved with right click
+                file = output_file_with_audio
+
+        previews = [
+            {
+                "filename": file,
+                "subfolder": subfolder,
+                "type": "output" if save_output else "temp",
+                "format": format,
+                "frame_rate": frame_rate,
+            }
+        ]
+        if num_frames == 1 and 'png' in format and '%03d' in file:
+            previews[0]['format'] = 'image/png'
+            previews[0]['filename'] = file.replace('%03d', '001')
+        return {"ui": {"gifs": previews}, "result": ((save_output, output_files),)}
+    @classmethod
+    def VALIDATE_INPUTS(self, format, **kwargs):
+        return True
 class LoadAudio:
     @classmethod
     def INPUT_TYPES(s):
