@@ -231,8 +231,8 @@ class VideoCombine:
             },
         }
 
-    RETURN_TYPES = ("VHS_FILENAMES",)
-    RETURN_NAMES = ("Filenames",)
+    RETURN_TYPES = ("VHS_FILENAMES", "VIDEO_CONTENT")
+    RETURN_NAMES = ("Filenames", "VideoContent")
     OUTPUT_NODE = True
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     FUNCTION = "combine_video"
@@ -258,7 +258,7 @@ class VideoCombine:
         if latents is not None:
             images = latents
         if images is None:
-            return ((save_output, []),)
+            return ((save_output, []), None)
         if vae is not None:
             if isinstance(images, dict):
                 images = images['samples']
@@ -266,7 +266,8 @@ class VideoCombine:
                 vae = None
 
         if isinstance(images, torch.Tensor) and images.size(0) == 0:
-            return ((save_output, []),)
+            return ((save_output, []), None)
+        
         num_frames = len(images)
         pbar = ProgressBar(num_frames)
         if vae is not None:
@@ -274,7 +275,6 @@ class VideoCombine:
             width = images.size(3)*downscale_ratio
             height = images.size(2)*downscale_ratio
             frames_per_batch = (1920 * 1080 * 16) // (width * height) or 1
-            #Python 3.12 adds an itertools.batched, but it's easily replicated for legacy support
             def batched(it, n):
                 while batch := tuple(itertools.islice(it, n)):
                     yield batch
@@ -284,12 +284,11 @@ class VideoCombine:
                     yield from vae.decode(image_batch)
             images = batched_encode(images, vae, frames_per_batch)
             first_image = next(images)
-            #repush first_image
             images = itertools.chain([first_image], images)
         else:
             first_image = images[0]
             images = iter(images)
-        # get output information
+
         output_dir = (
             folder_paths.get_output_directory()
             if save_output
@@ -312,32 +311,23 @@ class VideoCombine:
         if extra_pnginfo is not None:
             for x in extra_pnginfo:
                 metadata.add_text(x, json.dumps(extra_pnginfo[x]))
-                video_metadata[x] = extra_pnginfo[x]
+                video_metadata[x] = json.dumps(extra_pnginfo[x])
         metadata.add_text("CreationTime", datetime.datetime.now().isoformat(" ")[:19])
 
         if meta_batch is not None and unique_id in meta_batch.outputs:
             (counter, output_process) = meta_batch.outputs[unique_id]
         else:
-            # comfy counter workaround
             max_counter = 0
-
-            # Loop through the existing files
             matcher = re.compile(f"{re.escape(filename)}_(\\d+)\\D*\\..+", re.IGNORECASE)
             for existing_file in os.listdir(full_output_folder):
-                # Check if the file matches the expected format
                 match = matcher.fullmatch(existing_file)
                 if match:
-                    # Extract the numeric portion of the filename
                     file_counter = int(match.group(1))
-                    # Update the maximum counter value if necessary
                     if file_counter > max_counter:
                         max_counter = file_counter
-
-            # Increment the counter by 1 to get the next available value
             counter = max_counter + 1
             output_process = None
 
-        # save first frame as png to keep metadata
         file = f"{filename}_{counter:05}.png"
         file_path = os.path.join(full_output_folder, file)
         Image.fromarray(tensor_to_bytes(first_image)).save(
@@ -355,7 +345,6 @@ class VideoCombine:
             if format_ext == "gif":
                 image_kwargs['disposal'] = 2
             if format_ext == "webp":
-                #Save timestamp information
                 exif = Image.Exif()
                 exif[ExifTags.IFD.Exif] = {36867: datetime.datetime.now().isoformat(" ")[:19]}
                 image_kwargs['exif'] = exif
@@ -364,7 +353,6 @@ class VideoCombine:
             if pingpong:
                 images = to_pingpong(images)
             frames = map(lambda x : Image.fromarray(tensor_to_bytes(x)), images)
-            # Use pillow directly to save an animated image
             next(frames).save(
                 file_path,
                 format=format_ext.upper(),
@@ -379,9 +367,7 @@ class VideoCombine:
         else:
             # Use ffmpeg to save a video
             if ffmpeg_path is None:
-                raise ProcessLookupError(f"ffmpeg is required for video outputs and could not be found.\nIn order to use video outputs, you must either:\n- Install imageio-ffmpeg with pip,\n- Place a ffmpeg executable in {os.path.abspath('')}, or\n- Install ffmpeg and add it to the system path.")
-
-            #Acquire additional format_widget values
+                raise ProcessLookupError("ffmpeg is required for video outputs and could not be found.")
             kwargs = None
             if manual_format_widgets is None:
                 if prompt is not None:
@@ -396,28 +382,21 @@ class VideoCombine:
                         kwargs[k] = manual_format_widgets[k]
                     else:
                         missing[k] = kwargs[k]
-                if len(missing) > 0:
-                    logger.warn("Extra format values were not provided, the following defaults will be used: " + str(kwargs) + "\nThis is likely due to usage of ComfyUI-to-python. These values can be manually set by supplying a manual_format_widgets argument")
 
             video_format = apply_format_widgets(format_ext, kwargs)
             has_alpha = first_image.shape[-1] == 4
             dim_alignment = video_format.get("dim_alignment", 8)
             if (first_image.shape[1] % dim_alignment) or (first_image.shape[0] % dim_alignment):
-                #output frames must be padded
-                to_pad = (-first_image.shape[1] % dim_alignment,
-                          -first_image.shape[0] % dim_alignment)
-                padding = (to_pad[0]//2, to_pad[0] - to_pad[0]//2,
-                           to_pad[1]//2, to_pad[1] - to_pad[1]//2)
+                to_pad = (-first_image.shape[1] % dim_alignment, -first_image.shape[0] % dim_alignment)
+                padding = (to_pad[0]//2, to_pad[0] - to_pad[0]//2, to_pad[1]//2, to_pad[1] - to_pad[1]//2)
                 padfunc = torch.nn.ReplicationPad2d(padding)
                 def pad(image):
-                    image = image.permute((2,0,1))#HWC to CHW
+                    image = image.permute((2,0,1))
                     padded = padfunc(image.to(dtype=torch.float32))
                     return padded.permute((1,2,0))
                 images = map(pad, images)
-                new_dims = (-first_image.shape[1] % dim_alignment + first_image.shape[1],
-                            -first_image.shape[0] % dim_alignment + first_image.shape[0])
+                new_dims = (-first_image.shape[1] % dim_alignment + first_image.shape[1], -first_image.shape[0] % dim_alignment + first_image.shape[0])
                 dimensions = f"{new_dims[0]}x{new_dims[1]}"
-                logger.warn("Output images were not of valid resolution and have had padding applied")
             else:
                 dimensions = f"{first_image.shape[1]}x{first_image.shape[0]}"
             if loop_count > 0:
