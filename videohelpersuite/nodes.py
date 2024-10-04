@@ -244,22 +244,30 @@ class VideoCombine:
         # Thiết lập xác thực
         SCOPES = ['https://www.googleapis.com/auth/drive.file']
         SERVICE_ACCOUNT_FILE = '/content/drive/MyDrive/SD-Data/comfyui-n8n-aici01-7679b55c962b.json'
-
+    
         credentials = service_account.Credentials.from_service_account_file(
             SERVICE_ACCOUNT_FILE, scopes=SCOPES)
         service = build('drive', 'v3', credentials=credentials)
-
+    
         # Tải file lên Google Drive
-        file_metadata = {'name': os.path.basename(file_path), 'parents': ['1fZyeDT_eW6ozYXhqi_qLVy-Xnu5JD67a']}
+        file_metadata = {
+            'name': os.path.basename(file_path),
+            'parents': ['1fZyeDT_eW6ozYXhqi_qLVy-Xnu5JD67a']  # Thư mục cha
+        }
         media = MediaFileUpload(file_path, resumable=True)
-
+    
+        # Tạo file trên Google Drive
         file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        file_id = file.get('id')
-
-        # Lấy link chia sẻ của file
-        self.drive_service.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
-        return f"https://drive.google.com/uc?id={file_id}"
-        
+    
+        # Thay đổi quyền truy cập để file công khai
+        permission = {
+            'type': 'anyone',
+            'role': 'reader',
+        }
+        service.permissions().create(fileId=file.get('id'), body=permission).execute()
+    
+        return f"https://drive.google.com/file/d/{file.get('id')}/view?usp=sharing"
+            
     def combine_video(
         self,
         frame_rate: int,
