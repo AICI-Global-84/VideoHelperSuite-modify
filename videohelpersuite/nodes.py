@@ -971,7 +971,7 @@ class Unbatch:
         return True
 
 NODE_CLASS_MAPPINGS = {
-    "VHS_VideoCombine": Video,
+    "VHS_VideoCombine": VideoCombine,
     "VHS_LoadVideo": LoadVideoUpload,
     "VHS_LoadVideoPath": LoadVideoPath,
     "VHS_LoadImages": LoadImagesFromDirectoryUpload,
@@ -1011,7 +1011,7 @@ NODE_CLASS_MAPPINGS = {
     "VHS_Unbatch": Unbatch,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VHS_Video": "Video  🎥🅥🅗🅢",
+    "VHS_Video": "VideoCombine 🎥🅥🅗🅢",
     "VHS_LoadVideo": "Load Video (Upload) 🎥🅥🅗🅢",
     "VHS_LoadVideoPath": "Load Video (Path) 🎥🅥🅗🅢",
     "VHS_LoadImages": "Load Images (Upload) 🎥🅥🅗🅢",
